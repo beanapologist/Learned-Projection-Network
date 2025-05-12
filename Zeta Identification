@@ -1,0 +1,288 @@
+from mpmath import mp, mpf, im, re, log, pi, loggamma, zeta, exp, sin, cos
+import numpy as np
+import heapq
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+# Set precision for mpmath
+mp.dps = 30
+
+# Global evaluation counter
+evaluation_count = 0
+MAX_EVALUATIONS_PER_ITERATION = 10000
+
+@dataclass
+class Box:
+    """Represents a computational box in the t-domain with priority"""
+    left: mpf
+    right: mpf
+    min_z_abs: float
+    priority_score: float = 0.0
+    iteration_found: int = 0
+    
+    def __lt__(self, other):
+        # For heap - lower min_z_abs has higher priority
+        return self.min_z_abs < other.min_z_abs
+    
+    def size(self) -> mpf:
+        return self.right - self.left
+
+class BeanMethodZetaFinder:
+    """Bean Method implementation for Riemann zeta zero finding"""
+    
+    def __init__(self, lambda_val=0.5, tolerance=mpf('1e-15')):
+        self.lambda_val = lambda_val
+        self.tolerance = tolerance
+        self.zeros_found = set()
+        self.evaluation_count = 0
+        self.method_stats = {
+            'bisection_count': 0,
+            'secant_count': 0,
+            'total_evaluations': 0
+        }
+    
+    def Z(self, t):
+        """Compute Z(t) = e^(i*theta(t)) * ζ(lambda + it)"""
+        self.evaluation_count += 1
+        s = self.lambda_val + 1j * t
+        theta_val = self._theta(t)
+        return exp(1j * theta_val) * zeta(s)
+    
+    def _theta(self, t):
+        """Riemann-Siegel theta function"""
+        return -t/2 * log(pi) + im(loggamma(self.lambda_val/2 + 1j*t/2))
+    
+    def secant_refine(self, t_left, t_right, max_iter=50):
+        """Secant method refinement - the core of the bean method"""
+        self.method_stats['secant_count'] += 1
+        
+        a = mpf(t_left)
+        b = mpf(t_right)
+        fa = re(self.Z(a))
+        fb = re(self.Z(b))
+        
+        if fa * fb >= 0:
+            # Fallback to bisection if secant conditions not met
+            return self._bisection_refine(a, b)
+        
+        for iteration in range(max_iter):
+            if abs(b - a) < self.tolerance:
+                return (a + b) / 2
+            
+            # Secant method step
+            if abs(fb - fa) < mpf('1e-20'):  # Avoid division by very small number
+                return self._bisection_refine(a, b)
+            
+            c = b - fb * (b - a) / (fb - fa)
+            
+            # Ensure c is within bounds
+            if c <= a or c >= b:
+                c = (a + b) / 2
+            
+            fc = re(self.Z(c))
+            
+            if abs(fc) < self.tolerance:
+                return c
+            
+            # Update interval
+            if fa * fc < 0:
+                b = c
+                fb = fc
+            else:
+                a = c
+                fa = fc
+        
+        return (a + b) / 2
+    
+    def _bisection_refine(self, t_left, t_right):
+        """Fallback bisection method"""
+        self.method_stats['bisection_count'] += 1
+        
+        while t_right - t_left > self.tolerance:
+            t_mid = (t_left + t_right) / 2
+            z_mid = re(self.Z(t_mid))
+            z_left = re(self.Z(t_left))
+            
+            if abs(z_mid) < self.tolerance:
+                return t_mid
+            
+            if (z_mid > 0 and z_left > 0) or (z_mid < 0 and z_left < 0):
+                t_left = t_mid
+            else:
+                t_right = t_mid
+        
+        return (t_left + t_right) / 2
+    
+    def analyze_box(self, box: Box, num_points=500) -> Tuple[List[Box], mpf]:
+        """Analyze a box for sign changes using the bean method philosophy"""
+        t_values = np.linspace(float(box.left), float(box.right), num_points)
+        z_values = []
+        min_z_abs = float('inf')
+        
+        for t in t_values:
+            if self.evaluation_count >= MAX_EVALUATIONS_PER_ITERATION:
+                print(f"Warning: Evaluation limit reached in box [{box.left}, {box.right}]")
+                break
+            
+            z = self.Z(mpf(t))
+            z_values.append(z)
+            min_z_abs = min(min_z_abs, abs(re(z)))
+        
+        # Find sign changes (potential zeros)
+        new_boxes = []
+        for i in range(len(z_values) - 1):
+            z_real_i = re(z_values[i])
+            z_real_i1 = re(z_values[i+1])
+            
+            if z_real_i * z_real_i1 < 0:  # Sign change detected
+                t_left = mpf(t_values[i])
+                t_right = mpf(t_values[i+1])
+                
+                # Calculate priority based on min |Z(t)| in this interval
+                local_min_z = min(abs(z_real_i), abs(z_real_i1))
+                
+                new_box = Box(
+                    left=t_left,
+                    right=t_right,
+                    min_z_abs=local_min_z,
+                    iteration_found=box.iteration_found + 1
+                )
+                new_boxes.append(new_box)
+        
+        return new_boxes, mpf(min_z_abs)
+    
+    def bean_game_framework(self, t_start, t_end, initial_box_size=5.0, min_box_size=mpf('1e-10')):
+        """
+        Bean method framework for finding zeta zeros
+        - Prioritizes boxes with smallest |Z(t)|
+        - Uses secant method for fast refinement
+        - Implements adaptive box subdivision
+        """
+        # Initialize with priority queue (heapq)
+        initial_boxes = []
+        t = t_start
+        while t < t_end:
+            box_end = min(t + initial_box_size, t_end)
+            box = Box(left=mpf(t), right=mpf(box_end), min_z_abs=float('inf'))
+            initial_boxes.append(box)
+            t += initial_box_size
+        
+        # Convert to heap after analyzing each box
+        print("Initializing boxes and establishing priorities...")
+        priority_queue = []
+        
+        for box in initial_boxes:
+            sub_boxes, min_z = self.analyze_box(box, num_points=100)
+            if sub_boxes:
+                for sub_box in sub_boxes:
+                    heapq.heappush(priority_queue, sub_box)
+        
+        iteration = 0
+        print(f"\nStarting bean method with {len(priority_queue)} prioritized boxes")
+        
+        while priority_queue:
+            self.evaluation_count = 0  # Reset per iteration
+            iteration += 1
+            print(f"\nIteration {iteration}: Processing {len(priority_queue)} boxes")
+            
+            # Process boxes in priority order
+            current_boxes = list(priority_queue)
+            priority_queue = []
+            
+            for box in current_boxes:
+                if box.size() < min_box_size:
+                    # Box is small enough - refine to find zero
+                    zero = self.secant_refine(box.left, box.right)
+                    
+                    # Check if this is a new zero
+                    is_new = True
+                    for existing_zero in self.zeros_found:
+                        if abs(zero - existing_zero) < mpf('1e-12'):
+                            is_new = False
+                            break
+                    
+                    if is_new:
+                        self.zeros_found.add(zero)
+                        print(f"  Found zero: {mp.nstr(zero, 20)}")
+                else:
+                    # Subdivide box further
+                    sub_boxes, _ = self.analyze_box(box, num_points=200)
+                    for sub_box in sub_boxes:
+                        heapq.heappush(priority_queue, sub_box)
+        
+        return sorted(list(self.zeros_found), key=lambda x: float(x))
+    
+    def validate_zeros(self, known_zeros):
+        """Validate found zeros against known values"""
+        found = set(self.zeros_found)
+        known = set(mpf(str(z)) for z in known_zeros)
+        
+        print("\nValidation Results:")
+        print("=" * 40)
+        
+        # Check for matches
+        matched = 0
+        for known_zero in known:
+            for found_zero in found:
+                if abs(known_zero - found_zero) < mpf('1e-10'):
+                    matched += 1
+                    break
+        
+        print(f"Zeros found: {len(found)}")
+        print(f"Known zeros: {len(known)}")
+        print(f"Matched: {matched}")
+        print(f"Method statistics:")
+        print(f"  Secant refinements: {self.method_stats['secant_count']}")
+        print(f"  Bisection fallbacks: {self.method_stats['bisection_count']}")
+        print(f"  Total evaluations: {self.evaluation_count}")
+        
+        # Find missed zeros
+        missed = []
+        for known_zero in known:
+            found_match = False
+            for found_zero in found:
+                if abs(known_zero - found_zero) < mpf('1e-10'):
+                    found_match = True
+                    break
+            if not found_match:
+                missed.append(known_zero)
+        
+        if missed:
+            print(f"\nMissed zeros: {[mp.nstr(z, 15) for z in missed]}")
+        else:
+            print("\nNo zeros missed! 🎯")
+        
+        return matched, len(found), len(known)
+
+# Example usage with bean method
+def run_bean_method_demo():
+    """Demonstrate the bean method for finding zeta zeros"""
+    print("Bean Method for Riemann Zeta Zeros")
+    print("=" * 40)
+    
+    finder = BeanMethodZetaFinder()
+    
+    # Find zeros in [0, 40]
+    t_start, t_end = 0, 40
+    zeros = finder.bean_game_framework(t_start, t_end, initial_box_size=5.0)
+    
+    print(f"\nFound {len(zeros)} zeros in [{t_start}, {t_end}]:")
+    for zero in zeros:
+        print(f"  t = {mp.nstr(zero, 20)}")
+    
+    # Validate against known zeros
+    known_zeros = [
+        '14.134725141734693790457251983562',
+        '21.022039638771554992628479593896',
+        '25.010857580145688763213790992562',
+        '30.424876125859513210311897530104',
+        '32.935061587739189690662368964074',
+        '37.586178158825671257217763480705'
+    ]
+    
+    finder.validate_zeros(known_zeros)
+    
+    return finder, zeros
+
+if __name__ == "__main__":
+    finder, zeros = run_bean_method_demo()
